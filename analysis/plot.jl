@@ -82,6 +82,39 @@ end
 # Geometric mean (skipping missing/non-positive)
 geomean(xs) = (ys = filter(x -> x > 0, xs); isempty(ys) ? NaN : exp(mean(log, ys)))
 
+# Arms that track a moving target (the nightly channels) are drawn as the snapshot they
+# are: hollow markers, and dashed, fainter connectors on either side, against the solid
+# line through the releases. Which build each snapshot was is in the table under the legend.
+moving_target(v) = occursin("nightly", v)
+const MOVING = [moving_target(v) for v in JULIA_VERSIONS]
+# Axis label per arm. A moving-target arm also says which release it is heading for, from
+# the build's version in the metadata: "nightly (1.14)".
+builds = get(meta, "julia_builds", Dict())
+function arm_label(v)
+    moving_target(v) || return v
+    m = match(r"^(\d+\.\d+)", string(get(get(builds, v, Dict()), "version", "")))
+    m === nothing ? v : "$v ($(m.captures[1]))"
+end
+const ARM_LABELS = map(arm_label, JULIA_VERSIONS)
+
+function plot_series!(plt, ys; color, alpha, linewidth, markershape, markersize, label)
+    n = length(ys)
+    for i in 1:n-1
+        dashed = MOVING[i] || MOVING[i+1]
+        plot!(plt, i:i+1, ys[i:i+1];
+              color, alpha = dashed ? 0.6 * alpha : alpha,
+              linewidth = dashed ? 0.7 * linewidth : linewidth,
+              linestyle = dashed ? :dash : :solid, label = "")
+    end
+    stable, snaps = findall(!, MOVING), findall(MOVING)
+    scatter!(plt, stable, ys[stable];
+             color, alpha, markershape, markersize, markerstrokewidth = 0, label)
+    isempty(snaps) && return
+    scatter!(plt, snaps, ys[snaps];
+             color = :white, markershape, markersize, alpha,
+             markerstrokecolor = color, markerstrokewidth = 0.25 * markersize, label = "")
+end
+
 # Format log-axis ticks as plain decimals (0.01, 0.1, 1, 10, 100, ...)
 function decimal_ticks(ymin, ymax)
     lo = floor(Int, log10(ymin))
@@ -116,7 +149,7 @@ panels = map(enumerate(METRICS)) do (idx, m)
         bottom_margin = 0Plots.mm,
         ylabel      = idx == 1 ? "seconds" : "",
         yscale      = :log10,
-        xticks      = (1:length(JULIA_VERSIONS), JULIA_VERSIONS),
+        xticks      = (1:length(JULIA_VERSIONS), ARM_LABELS),
         xrotation   = 20,
         legend      = false,
         grid        = true,
@@ -160,10 +193,9 @@ panels = map(enumerate(METRICS)) do (idx, m)
         by_ver = tasks[key]
         ys = [get(get(by_ver, v, Dict{String,Float64}()), m.field, NaN) for v in JULIA_VERSIONS]
         any(isfinite, ys) || continue
-        plot!(plt, 1:length(JULIA_VERSIONS), ys;
-              color = palette[i], alpha = 0.55, linewidth = 1.8,
-              markershape = :circle, markersize = 2.5, markerstrokewidth = 0,
-              label = key[2])
+        plot_series!(plt, ys;
+                     color = palette[i], alpha = 0.55, linewidth = 1.8,
+                     markershape = :circle, markersize = 2.5, label = key[2])
     end
 
     # Geometric mean across tasks per version (per-metric: only tasks with a
@@ -171,9 +203,9 @@ panels = map(enumerate(METRICS)) do (idx, m)
     metric_keys = clean_keys_per_metric[m.field]
     gm = [geomean([tasks[k][v][m.field] for k in metric_keys])
           for v in JULIA_VERSIONS]
-    plot!(plt, 1:length(JULIA_VERSIONS), gm;
-          color = :crimson, linewidth = 3, markershape = :diamond, markersize = 6,
-          label = "")
+    plot_series!(plt, gm;
+                 color = :crimson, alpha = 1.0, linewidth = 3,
+                 markershape = :diamond, markersize = 6, label = "")
 
     # Per-panel count of contributing tasks, plus how the metric was sampled
     title!(plt, string(m.title, "\nGeomean of ", length(metric_keys), "/", length(tasks), ", ", m.sampling))
@@ -244,12 +276,24 @@ n_rows = cld(n_entries, LEGEND_COLS)
 
 # The exact build behind each arm, as a small table under the legend using the legend's
 # columns: arm, version, commit. Arms fill each column top to bottom, in plot order.
-builds = get(meta, "julia_builds", Dict())
 build_rows = [(arm = v, version = string(get(b, "version", "?")), commit = string(get(b, "commit_short", "?")))
               for v in JULIA_VERSIONS for b in (get(builds, v, nothing),) if b isa AbstractDict]
 n_build_rows = cld(length(build_rows), LEGEND_COLS)
-# Half a row of air between the legend and the build table
-n_total_rows = n_rows + (n_build_rows > 0 ? n_build_rows + 0.5 : 0)
+# The machine the run happened on, as one line under the build table: timings from
+# different machines are not comparable, so the plot should say what this was. Spec only,
+# no hostname, since the plot gets posted publicly.
+sys = get(meta, "system", Dict())
+machine_line = isempty(sys) ? nothing :
+    string("Run on ", get(sys, "cpu", "?"), ", ",
+           get(sys, "cpu_threads", "?"), " threads, ",
+           round(Int, get(sys, "total_memory_gb", 0)), " GiB, ", get(sys, "uname", "?"))
+snapshot_note = any(MOVING) ?
+    string("Hollow markers, dashed lines: ", join(ARM_LABELS[MOVING], ", "),
+           count(MOVING) == 1 ? " is" : " are", " a moving target; this is one day's build") : nothing
+# Half a row of air between the legend and the build table, then one footer row for the
+# machine line and the snapshot note.
+n_footer = (machine_line === nothing && snapshot_note === nothing) ? 0 : 1
+n_total_rows = n_rows + (n_build_rows > 0 ? n_build_rows + 0.5 : 0) + n_footer
 row_y(row) = 0.98 - (row + 0.5) * (0.96 / n_total_rows)
 
 legend_pane = plot(;
@@ -282,6 +326,16 @@ for (i, b) in enumerate(build_rows)
     annotate!(legend_pane, x0,         y, text(b.arm,     7, colorant"#2b2b29", :left, :vcenter))
     annotate!(legend_pane, x0 + 0.075, y, text(b.version, 7, colorant"#6b6a66", :left, :vcenter))
     annotate!(legend_pane, x0 + 0.150, y, text(b.commit,  7, colorant"#6b6a66", :left, :vcenter))
+end
+
+footer_y = row_y(n_rows + 0.5 + n_build_rows)
+if machine_line !== nothing
+    annotate!(legend_pane, 0.015 / LEGEND_COLS, footer_y,
+              text(machine_line, 7, colorant"#6b6a66", :left, :vcenter))
+end
+if snapshot_note !== nothing
+    annotate!(legend_pane, (LEGEND_COLS - 1 + 0.015) / LEGEND_COLS, footer_y,
+              text(snapshot_note, 7, colorant"#6b6a66", :left, :vcenter))
 end
 
 # Approx: each row ~ 22 px, plus padding above and below the block

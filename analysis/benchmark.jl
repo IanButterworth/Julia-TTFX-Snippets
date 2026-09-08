@@ -5,7 +5,7 @@ using Printf, Dates
 const JULIA_VERSIONS = ["nightly", "1.13", "1.12", "1.11", "1.10"]
 # Label => juliaup channel, for arms that run something other than the channel of their
 # name (a PR build standing in for a release, say). Empty: every label is its own channel.
-const VERSION_CHANNEL = Dict{String, String}()
+const VERSION_CHANNEL = Dict{String, String}("1.13" => "1.13-nightly") # release-1.13 nightly channel, rc4.7
 const VERSION_OPT = Dict{String,Int}()
 # The task script is run this many times in fresh processes, with the compiled cache and
 # JIT object cache cleared once per task beforehand. Each repeat's load and run
@@ -121,9 +121,24 @@ function capture_soft(cmd::Cmd)
     out, err, ok
 end
 
+# Depot path per channel: the sweep depot first, then that julia's own bundled depots (the
+# stdlib caches under <root>/share/julia). Never the default ~/.julia: Pkg takes a package
+# tree from any depot on the path, and a compiled cache there that happens to be valid for
+# a release arm would let it skip precompile work the other arms are doing.
+const CHANNEL_DEPOT_PATH = Dict{String,String}()
+function depot_path_for(ch::String, depot::String)
+    get!(CHANNEL_DEPOT_PATH, ch) do
+        out, _, ok = capture_soft(`julia +$ch --startup-file=no -e 'print(dirname(Sys.BINDIR))'`)
+        ok || error("julia +$ch failed to report its install root")
+        root = strip(out)
+        join([depot, joinpath(root, "local", "share", "julia"), joinpath(root, "share", "julia")],
+             Sys.iswindows() ? ';' : ':')
+    end
+end
+
 function run_task(ver::String, depot::String, task::TaskInfo)
     ch = get(VERSION_CHANNEL, ver, ver)
-    depot_path = depot * ":"
+    depot_path = depot_path_for(ch, depot)
     proj = task.dir
     base_env    = ("JULIA_DEPOT_PATH" => depot_path,)
     inst_env    = ("JULIA_DEPOT_PATH" => depot_path, "JULIA_PKG_PRECOMPILE_AUTO" => "0")
